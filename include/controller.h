@@ -161,10 +161,41 @@ typedef struct {
     char    name[VC_CLIENT_NAME_LEN];   /* UTF-8, NUL-padded, need not be terminated */
 } vc_packet_hello_t;
 
+/* VC_MSG_WELCOME: the host's answer to HELLO. The client tags every INPUT
+ * datagram with `token`. */
+typedef struct {
+    uint32_t token;        /* never 0 */
+    uint8_t  slot;         /* 0..3, also the player number minus one */
+    uint8_t  caps;         /* VC_CAP_* granted: offered by the client and supported */
+    uint16_t timeout_ms;   /* input silence after which the host releases all controls */
+} vc_packet_welcome_t;
+
 /* VC_MSG_PING and VC_MSG_PONG: the receiver echoes the value back. */
 typedef struct {
     uint32_t echo;
 } vc_packet_ping_t;
+
+/* VC_MSG_FEEDBACK: rumble and light bar state for the client to render. */
+typedef struct {
+    uint8_t rumble_low;    /* 0..255, large motor */
+    uint8_t rumble_high;   /* 0..255, small motor */
+    uint8_t led[3];        /* r, g, b */
+    uint8_t player;        /* player indicator, 1..4, 0 if none */
+} vc_packet_feedback_t;
+
+/* VC_MSG_ERROR: why the host is about to close the connection. */
+typedef enum {
+    VC_ERROR_BAD_VERSION = 1,   /* protocol version not supported */
+    VC_ERROR_NO_SLOT     = 2,   /* all slots in use */
+    VC_ERROR_UNSUPPORTED = 3,   /* controller type unknown or not available on this host */
+    VC_ERROR_PROTOCOL    = 4,   /* malformed or unexpected message */
+    VC_ERROR_TIMEOUT     = 5,   /* no HELLO, no PONG or no input in time */
+    VC_ERROR_DRIVER      = 6    /* the virtual gamepad could not be created or updated */
+} vc_error_code_t;
+
+typedef struct {
+    uint8_t code;          /* vc_error_code_t */
+} vc_packet_error_t;
 
 /* VC_MSG_INPUT: fixed part of every input datagram. A full snapshot, never a
  * delta. Followed by vc_packet_motion_t if VC_INPUT_HAS_MOTION is set, then
@@ -207,7 +238,10 @@ typedef struct {
 /* Wire sizes in bytes. */
 #define VC_PACKET_HEADER_SIZE  8
 #define VC_PACKET_HELLO_SIZE   34
+#define VC_PACKET_WELCOME_SIZE 8
 #define VC_PACKET_PING_SIZE    4
+#define VC_PACKET_FEEDBACK_SIZE 6
+#define VC_PACKET_ERROR_SIZE   1
 #define VC_PACKET_INPUT_SIZE   24
 #define VC_PACKET_MOTION_SIZE  12
 #define VC_PACKET_TOUCH_SIZE   12
@@ -223,7 +257,10 @@ typedef struct {
 
 VC_STATIC_ASSERT(sizeof(vc_packet_header_t) == VC_PACKET_HEADER_SIZE, header_size);
 VC_STATIC_ASSERT(sizeof(vc_packet_hello_t)  == VC_PACKET_HELLO_SIZE,  hello_size);
+VC_STATIC_ASSERT(sizeof(vc_packet_welcome_t) == VC_PACKET_WELCOME_SIZE, welcome_size);
 VC_STATIC_ASSERT(sizeof(vc_packet_ping_t)   == VC_PACKET_PING_SIZE,   ping_size);
+VC_STATIC_ASSERT(sizeof(vc_packet_feedback_t) == VC_PACKET_FEEDBACK_SIZE, feedback_size);
+VC_STATIC_ASSERT(sizeof(vc_packet_error_t)  == VC_PACKET_ERROR_SIZE,  error_size);
 VC_STATIC_ASSERT(sizeof(vc_packet_input_t)  == VC_PACKET_INPUT_SIZE,  input_size);
 VC_STATIC_ASSERT(sizeof(vc_packet_motion_t) == VC_PACKET_MOTION_SIZE, motion_size);
 VC_STATIC_ASSERT(sizeof(vc_packet_touch_t)  == VC_PACKET_TOUCH_SIZE,  touch_size);

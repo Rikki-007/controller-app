@@ -1,0 +1,9 @@
+// Clang module for the Swift package (Package.swift): what Swift sees of
+// the C core. Only the phone-side API (engine, layout) and the wire types; the daemon's
+// headers in this directory stay out of the app.
+module VCCore {
+    header "controller.h"
+    header "vc_client.h"
+    header "layout.h"
+    export *
+}
