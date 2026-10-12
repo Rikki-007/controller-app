@@ -1,2 +1,11 @@
 build/
 third_party/
+
+# Swift package
+.build/
+.swiftpm/
+
+# Android / Gradle
+.gradle/
+.cxx/
+local.properties

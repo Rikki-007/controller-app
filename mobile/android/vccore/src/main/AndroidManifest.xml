@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Merged into the app's manifest. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- TCP and UDP to vcd on the LAN. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- The low-latency Wi-Fi lock held while connected. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+</manifest>

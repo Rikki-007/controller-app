@@ -19,24 +19,27 @@ controller-app/
 │   ├── controller.h         # controller types, button bits, vc_input_state_t, wire packet structs (written)
 │   ├── network.h            # UDP input listener (written)
 │   ├── parser.h             # INPUT decode, token/sequence checks, controller profiles, stream reassembly (written)
-│   ├── vc_protocol.h        # TCP control message encode/decode API
+│   ├── encoder.h            # INPUT encode, the inverse of the parser; used by vc_send and the tests (written)
+│   ├── protocol.h           # TCP control messages: encode/decode, stream reassembly (written)
 │   ├── hid_output.h         # report translation + virtual gamepad wrapper (written; replaces the §4 vtable)
-│   ├── vc_session.h         # slot/session lifecycle
-│   ├── vc_net.h             # socket + poll wrapper (Winsock / BSD)
+│   ├── session.h            # handshake, issued tokens, slots, keepalive and timeouts (written)
 │   └── vc_log.h
 ├── src/
 │   ├── main.c               # options, signal handling, poll loop, implicit slots keyed by token, timeouts (written)
-│   ├── server.c             # still to do: TCP control channel (listen, clients)
-│   ├── session.c            # still to do: handshake and issued tokens, replacing the implicit slots in main.c
+│   ├── session.c            # pure (no sockets, no clock): HELLO/WELCOME/PING/BYE, slots, timeouts (written)
 │   ├── network.c            # UDP socket (Winsock/POSIX), hands decoded packets to a callback (written)
 │   ├── parser.c             # pure: decode + validate, token/sequence checks, controller profiles (written)
-│   ├── protocol.c           # TCP control messages: byte-wise (de)serialisation, validation
-│   ├── state.c              # per-slot state store, neutralise on timeout
+│   ├── encoder.c            # pure: vc_input_state_t -> INPUT datagram (written)
+│   ├── protocol.c           # pure: TCP control messages, byte-wise, validated as soon as the header is in (written)
 │   ├── log.c
 │   ├── hid_output.c         # translation to Xbox 360 / DS4 / evdev; stub, ViGEm and uinput backends by compile flag (written)
 │   └── platform/            # clock_win32.c, clock_posix.c
-├── tests/                   # test_parser.c, test_network.c, test_hid_output.c, test_util.h (written); test_protocol.c, test_state.c, test_loopback.c
-├── tools/vc_send.c          # CLI test client (scripted input, no app needed)
+├── tests/                   # test_parser, test_network, test_hid_output, test_encoder, test_loopback, test_protocol, test_session, e2e.sh, test_util.h (written)
+├── tools/vc_send.c          # CLI test client: scripted input, many clients, bad packets (written)
+├── include/vc_client.h, src/vc_client.c  # phone-side engine shared by iOS and Android (written; docs/MOBILE.md)
+├── Package.swift, mobile/   # iOS Swift package and Android library around vc_client (written; docs/MOBILE.md)
+├── scripts/test.ps1         # Windows test runner; falls back to WSL when Smart App Control blocks (written)
+├── .github/workflows/ci.yml # Linux + Windows CI: unit tests, e2e, backend compile checks (written)
 ├── docs/BUILD.md            # compile flags and driver setup per backend (written)
 └── third_party/ViGEmClient/ # cloned at build time, Windows only (not vendored yet)
 ```
@@ -70,10 +73,10 @@ Two channels per client, same 8-byte header on both. All integers **little-endia
 | `WELCOME` 0x02 | H→C | token u32, slot u8, granted caps u8, input timeout ms u16 |
 | `PING`/`PONG` 0x03/0x04 | both | echo u32 (keepalive + RTT), every 1 s |
 | `FEEDBACK` 0x05 | H→C | rumble_low u8, rumble_high u8, led r,g,b u8, player u8 |
-| `ERROR` 0x06 | H→C | code u8 (bad version, no free slot, layout unsupported by driver) |
+| `ERROR` 0x06 | H→C | code u8: 1 bad version, 2 no free slot, 3 type unsupported, 4 protocol error, 5 timeout, 6 driver error |
 | `BYE` 0x07 | both | — |
 
-Lifecycle: `HELLO` → backend creates the virtual device → `WELCOME`. TCP close or 3 missed pings → device destroyed, slot freed.
+Lifecycle: `HELLO` → backend creates the virtual device → `WELCOME` (token random, never 0). The client must then send UDP input from the same IP address as its TCP connection. Device destroyed and slot freed on: `BYE`, TCP close, 3 unanswered host pings, 10 s without input, or a protocol error; all but the first two are announced with `ERROR` first. 250 ms without input only releases the controls. A connection without `HELLO` after 5 s gets `ERROR` timeout. As built in `session.h`; `--type` on the daemon is gone.
 
 ### 2.3 UDP `INPUT` (type 0x10)
 
@@ -117,7 +120,7 @@ Triggers are always analog on the wire; Switch ZL/ZR send 0 or 255. Motion is ig
 
 ## 3. Internal state representation
 
-`vc_controller_type_t` (Xbox 1, PS5 2, Switch 3, PS4 4), `vc_stick_t`, `vc_motion_t`, `vc_touch_point_t` and the layout-neutral snapshot `vc_input_state_t` are defined in `include/controller.h`, which is the source of truth. An all-zero `vc_input_state_t` is the neutral state. Still to come, in `vc_session.h`:
+`vc_controller_type_t` (Xbox 1, PS5 2, Switch 3, PS4 4), `vc_stick_t`, `vc_motion_t`, `vc_touch_point_t` and the layout-neutral snapshot `vc_input_state_t` are defined in `include/controller.h`, which is the source of truth. An all-zero `vc_input_state_t` is the neutral state. **As built**, `include/session.h` holds the per-connection and per-slot state (`vc_session_conn_t`, `vc_session_slot_t`: token, type, granted caps, parser, device, learned UDP peer, ping state) and `vc_packet_feedback_t` lives in `controller.h`. The original sketch:
 
 ```c
 typedef struct { uint8_t rumble_low, rumble_high, led[3], player; } vc_feedback_t;
@@ -138,7 +141,7 @@ typedef struct {
 } vc_slot_t;
 ```
 
-Data flow per datagram: `network.c` receive → `parser.c` decode + validate, then per-session token/sequence check and profile → `state.c` store → `driver->submit(dev, &state)`. Single thread, so no locking on state. Driver feedback callbacks that fire on another thread (ViGEm) write into a small per-slot mailbox that the loop drains.
+Data flow per datagram: `network.c` receive → `parser.c` decode + validate → `session.c` finds the slot by token, checks the source IP, runs the slot's parser (sequence, profile) → `vc_hid_submit()`. Control bytes: `network.c` → `session.c` → `protocol.c` reader → handler; replies go back through `vc_net_send()`. Single thread, so no locking on state. Driver feedback callbacks that fire on another thread (ViGEm) write into a small per-slot mailbox that the loop drains.
 
 ## 4. Virtual HID driver abstraction
 
@@ -190,7 +193,7 @@ Known limits, stated up front:
 ## 6. Milestones
 
 1. Done: Makefile, `controller.h`, input packet parser, unit tests.
-2. Partly done: poll loop, implicit sessions and stub backend are in `main.c`. Still to do: TCP handshake (`HELLO`/`WELCOME`, per-client controller type, issued tokens), `vc_send` test client, loopback test of the standalone binary.
+2. Written, not yet compiled (Smart App Control blocks the local compiler; CI is the first run): TCP control channel in `network.c`, `protocol.c`, `session.c` (handshake, per-client controller type, issued tokens, keepalive, timeouts), Windows `SIO_UDP_CONNRESET` off, `vc_send` speaking the handshake, unit tests and `tests/e2e.sh` covering every way a session ends.
 3. ViGEm backend: basic Xbox 360 and DS4 reports are written in `hid_output.c`; still to do: run against ViGEmBus, DS4 motion/touch via `DS4_REPORT_EX`.
 4. uinput backend: written in `hid_output.c`, never compiled; still to do: build and run on Linux, motion/touchpad devices.
 5. Feedback path (rumble/LED) end to end.

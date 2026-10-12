@@ -1,15 +1,14 @@
 /*
  * main.c - the virtual controller daemon (vcd).
  *
- * Listens for input packets, runs each through its session's parser and
- * pushes the result to a virtual gamepad:
+ * Wires the network layer to the session layer and runs the loop:
  *
- *   network.c  ->  parser.c  ->  hid_output.c
+ *   network.c  --TCP bytes-->  session.c (protocol.c)  --> hid_output.c
+ *              --UDP input-->  session.c (parser.c)    --> hid_output.c
  *
- * There is no handshake yet, so sessions are implicit: the first packet
- * carrying an unknown token opens a slot (up to VC_MAX_SLOTS) using the
- * controller type given on the command line. A slot is neutralised when its
- * client goes quiet and closed when it stays quiet.
+ * Clients connect over TCP and send HELLO to get a slot, a session token and
+ * a virtual gamepad of the type they asked for; then they stream input over
+ * UDP with that token. session.h describes the lifecycle and the timeouts.
  *
  * Single-threaded: everything runs on the main loop.
  */
@@ -18,6 +17,7 @@
 #    define _WIN32_WINNT 0x0600   /* GetTickCount64 */
 #  endif
 #  include <windows.h>
+#  include <bcrypt.h>             /* BCryptGenRandom */
 #else
 #  ifndef _POSIX_C_SOURCE
 #    define _POSIX_C_SOURCE 200112L
@@ -33,42 +33,23 @@
 #include "controller.h"
 #include "hid_output.h"
 #include "network.h"
-#include "parser.h"
+#include "session.h"
 
-#define VC_MAX_SLOTS          4
 /* How long the loop may sleep before checking timeouts and the stop flag. */
-#define POLL_INTERVAL_MS      50
-/* Silence after which a pad is neutralised, so no button stays held. */
-#define DEFAULT_TIMEOUT_MS    250
-/* Silence after which the pad is unplugged and its slot freed. */
-#define SLOT_IDLE_MS          10000
-/* Pause before trying to open a slot again after a failure. */
-#define OPEN_RETRY_MS         2000
+#define POLL_INTERVAL_MS 50
 
 typedef struct {
-    int              in_use;
-    uint32_t         token;
-    vc_net_peer_t    peer;
-    vc_parser_t      parser;
-    vc_hid_device_t *device;
-    uint64_t         last_input_ms;
-    int              neutral;        /* already neutralised after a timeout */
-    vc_input_state_t last_state;     /* for --print */
-} slot_t;
-
-typedef struct {
-    vc_controller_type_t type;
-    const char          *bind_address;
-    uint16_t             port;
-    unsigned             timeout_ms;
-    int                  print;
+    const char *bind_address;
+    uint16_t    port;
+    unsigned    timeout_ms;
+    int         print;
 } options_t;
 
 typedef struct {
-    options_t opts;
-    slot_t    slots[VC_MAX_SLOTS];
-    uint64_t  next_open_ms;      /* no new slots before this time */
-    uint64_t  dropped_no_slot;
+    options_t        opts;
+    vc_net_t        *net;
+    vc_sessions_t    sessions;
+    vc_input_state_t printed[VC_MAX_SLOTS];   /* for --print */
 } app_t;
 
 /* ------------------------------------------------------------------------ */
@@ -84,6 +65,39 @@ static uint64_t now_ms(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
 #endif
+}
+
+/* Session tokens come from the OS random generator, so a LAN peer cannot
+ * predict the next one. */
+static uint32_t random32(void *user)
+{
+    static int warned;
+    static uint32_t counter;
+    uint32_t value = 0;
+    int      ok;
+
+    (void)user;
+#ifdef _WIN32
+    ok = BCryptGenRandom(NULL, (PUCHAR)&value, (ULONG)sizeof value,
+                         BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
+#else
+    {
+        FILE *f = fopen("/dev/urandom", "rb");
+        ok = f != NULL && fread(&value, sizeof value, 1, f) == 1;
+        if (f != NULL) {
+            fclose(f);
+        }
+    }
+#endif
+    if (!ok) {
+        /* Still unique and non-zero, just guessable. */
+        if (!warned) {
+            fprintf(stderr, "warning: no OS random source; session tokens are predictable\n");
+            warned = 1;
+        }
+        value = (uint32_t)now_ms() * 2654435761u + ++counter;
+    }
+    return value;
 }
 
 static volatile sig_atomic_t g_stop;
@@ -111,87 +125,64 @@ static void install_signal_handlers(void)
     sigemptyset(&action.sa_mask);
     sigaction(SIGINT, &action, NULL);
     sigaction(SIGTERM, &action, NULL);
+    /* Writing to a client that has gone away must fail, not kill us. */
+    action.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &action, NULL);
 #endif
 }
 
 /* ------------------------------------------------------------------------ */
-/* Slots                                                                    */
+/* Wiring                                                                   */
 /* ------------------------------------------------------------------------ */
 
-static int slot_index(const app_t *app, const slot_t *slot)
+/* network.h callbacks -> session.h */
+
+static void on_input(const vc_net_input_t *input, void *user)
 {
-    return (int)(slot - app->slots);
+    vc_sessions_input(&((app_t *)user)->sessions, input, now_ms());
 }
 
-static void close_slot(app_t *app, slot_t *slot, const char *reason)
+static void on_connect(int conn, const vc_net_peer_t *peer, void *user)
 {
-    const vc_parser_stats_t *stats = &slot->parser.stats;
-
-    printf("slot %d closed (%s): %lu inputs accepted, %lu stale, %lu wrong token\n",
-           slot_index(app, slot), reason, (unsigned long)stats->accepted,
-           (unsigned long)stats->rejected_stale, (unsigned long)stats->rejected_token);
-    vc_hid_destroy(slot->device);
-    memset(slot, 0, sizeof *slot);
+    vc_sessions_connected(&((app_t *)user)->sessions, conn, peer, now_ms());
 }
 
-static slot_t *find_slot(app_t *app, uint32_t token)
+static void on_data(int conn, const uint8_t *data, size_t size, void *user)
 {
-    int i;
-
-    for (i = 0; i < VC_MAX_SLOTS; i++) {
-        if (app->slots[i].in_use && app->slots[i].token == token) {
-            return &app->slots[i];
-        }
-    }
-    return NULL;
+    vc_sessions_data(&((app_t *)user)->sessions, conn, data, size, now_ms());
 }
 
-static slot_t *open_slot(app_t *app, const vc_net_input_t *input, uint64_t now)
+static void on_disconnect(int conn, void *user)
 {
-    slot_t *slot = NULL;
-    int     i;
-
-    if (now < app->next_open_ms) {
-        return NULL;
-    }
-    for (i = 0; i < VC_MAX_SLOTS; i++) {
-        if (!app->slots[i].in_use) {
-            slot = &app->slots[i];
-            break;
-        }
-    }
-    if (slot == NULL) {
-        /* Log the 1st, 2nd, 4th... drop, not every packet. */
-        app->dropped_no_slot++;
-        if ((app->dropped_no_slot & (app->dropped_no_slot - 1)) == 0) {
-            fprintf(stderr, "all %d slots are in use; ignoring a new client (%lu packets so far)\n",
-                    VC_MAX_SLOTS, (unsigned long)app->dropped_no_slot);
-        }
-        return NULL;
-    }
-
-    memset(slot, 0, sizeof *slot);
-    if (vc_parser_init(&slot->parser, app->opts.type, input->packet.token) != 0 ||
-        vc_hid_create(app->opts.type, &slot->device) != 0) {
-        fprintf(stderr, "could not open a slot; retrying in %d ms\n", OPEN_RETRY_MS);
-        app->next_open_ms = now + OPEN_RETRY_MS;
-        return NULL;
-    }
-    slot->in_use = 1;
-    slot->token = input->packet.token;
-    slot->peer = input->peer;
-    slot->last_input_ms = now;
-
-    printf("slot %d opened for %u.%u.%u.%u:%u (token %08lx)\n", slot_index(app, slot),
-           input->peer.ip[0], input->peer.ip[1], input->peer.ip[2], input->peer.ip[3],
-           (unsigned)input->peer.port, (unsigned long)slot->token);
-    return slot;
+    vc_sessions_disconnected(&((app_t *)user)->sessions, conn, now_ms());
 }
 
-static void print_state(const app_t *app, slot_t *slot, const vc_input_state_t *state)
-{
-    const vc_input_state_t *last = &slot->last_state;
+/* session.h callbacks -> network.h and stdout */
 
+static int session_send(int conn, const uint8_t *data, size_t size, void *user)
+{
+    return vc_net_send(((app_t *)user)->net, conn, data, size);
+}
+
+static void session_disconnect(int conn, void *user)
+{
+    vc_net_disconnect(((app_t *)user)->net, conn);
+}
+
+static void session_log(const char *message, void *user)
+{
+    (void)user;
+    printf("%s\n", message);
+}
+
+static void session_state(int slot, const vc_input_state_t *state, void *user)
+{
+    app_t            *app = (app_t *)user;
+    vc_input_state_t *last = &app->printed[slot];
+
+    if (!app->opts.print) {
+        return;
+    }
     if (state->buttons == last->buttons &&
         state->left.x == last->left.x && state->left.y == last->left.y &&
         state->right.x == last->right.x && state->right.y == last->right.y &&
@@ -200,80 +191,10 @@ static void print_state(const app_t *app, slot_t *slot, const vc_input_state_t *
         return;
     }
     printf("slot %d: buttons=%05lx left=(%6d,%6d) right=(%6d,%6d) triggers=(%3u,%3u)\n",
-           slot_index(app, slot), (unsigned long)state->buttons,
+           slot, (unsigned long)state->buttons,
            state->left.x, state->left.y, state->right.x, state->right.y,
            (unsigned)state->trigger_left, (unsigned)state->trigger_right);
-    slot->last_state = *state;
-}
-
-/* Called by the network listener for every well-formed input packet. */
-static void on_input(const vc_net_input_t *input, void *user)
-{
-    app_t           *app = (app_t *)user;
-    uint64_t         now = now_ms();
-    vc_input_state_t state;
-    slot_t          *slot;
-
-    slot = find_slot(app, input->packet.token);
-    if (slot == NULL) {
-        slot = open_slot(app, input, now);
-        if (slot == NULL) {
-            return;
-        }
-    }
-
-    /* Rejections (stale, duplicate) are counted by the parser. */
-    if (vc_parser_accept(&slot->parser, &input->packet, &state) != VC_PARSE_OK) {
-        return;
-    }
-    if (vc_hid_submit(slot->device, &state) != 0) {
-        /* The driver already logged why. Drop the pad rather than fail on
-         * every packet; the client gets a fresh one after the retry delay. */
-        close_slot(app, slot, "driver error");
-        app->next_open_ms = now + OPEN_RETRY_MS;
-        return;
-    }
-    slot->last_input_ms = now;
-    slot->neutral = 0;
-    if (app->opts.print) {
-        print_state(app, slot, &state);
-    }
-}
-
-/* Releases everything on a pad: nothing pressed, sticks centred. */
-static void neutralise(slot_t *slot)
-{
-    vc_input_state_t neutral;
-
-    memset(&neutral, 0, sizeof neutral);
-    vc_hid_submit(slot->device, &neutral);
-    slot->last_state = neutral;
-    slot->neutral = 1;
-}
-
-static void check_timeouts(app_t *app)
-{
-    uint64_t now = now_ms();
-    int      i;
-
-    for (i = 0; i < VC_MAX_SLOTS; i++) {
-        slot_t  *slot = &app->slots[i];
-        uint64_t quiet;
-
-        if (!slot->in_use) {
-            continue;
-        }
-        quiet = now - slot->last_input_ms;
-        if (quiet >= SLOT_IDLE_MS) {
-            close_slot(app, slot, "client went away");
-        } else if (!slot->neutral && quiet >= app->opts.timeout_ms) {
-            printf("slot %d: no input for %u ms, releasing all controls\n", i,
-                   app->opts.timeout_ms);
-            neutralise(slot);
-            /* The client may restart its sequence numbers when it resumes. */
-            vc_parser_reset(&slot->parser);
-        }
-    }
+    *last = *state;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -284,35 +205,16 @@ static void usage(const char *program)
 {
     printf("usage: %s [options]\n"
            "\n"
-           "  --type TYPE     controller to emulate: xbox, ps4, ps5, switch (default xbox)\n"
-           "  --port PORT     UDP port to listen on (default %d)\n"
+           "  --port PORT     TCP and UDP port to listen on (default %d)\n"
            "  --bind ADDR     IPv4 address to listen on (default: all interfaces)\n"
-           "  --timeout MS    release all controls after this much silence (default %d)\n"
+           "  --timeout MS    release all controls after this much input silence\n"
+           "                  (default %d; the session ends after %d ms)\n"
            "  --print         print each change of state\n"
-           "  --help          show this text\n",
-           program, VC_DEFAULT_PORT, DEFAULT_TIMEOUT_MS);
-}
-
-static int parse_type(const char *text, vc_controller_type_t *out)
-{
-    static const struct {
-        const char          *name;
-        vc_controller_type_t type;
-    } types[] = {
-        { "xbox", VC_CONTROLLER_XBOX },
-        { "ps4", VC_CONTROLLER_PS4 },
-        { "ps5", VC_CONTROLLER_PS5 },
-        { "switch", VC_CONTROLLER_SWITCH }
-    };
-    size_t i;
-
-    for (i = 0; i < sizeof types / sizeof types[0]; i++) {
-        if (strcmp(text, types[i].name) == 0) {
-            *out = types[i].type;
-            return 0;
-        }
-    }
-    return -1;
+           "  --help          show this text\n"
+           "\n"
+           "Each client chooses its controller type in its HELLO message.\n",
+           program, VC_DEFAULT_PORT, VC_SESSION_INPUT_TIMEOUT_MS,
+           VC_SESSION_IDLE_TIMEOUT_MS);
 }
 
 static int parse_number(const char *text, long min, long max, long *out)
@@ -332,10 +234,9 @@ static int parse_options(int argc, char **argv, options_t *opts)
 {
     int i;
 
-    opts->type = VC_CONTROLLER_XBOX;
     opts->bind_address = NULL;
     opts->port = VC_DEFAULT_PORT;
-    opts->timeout_ms = DEFAULT_TIMEOUT_MS;
+    opts->timeout_ms = VC_SESSION_INPUT_TIMEOUT_MS;
     opts->print = 0;
 
     for (i = 1; i < argc; i++) {
@@ -349,18 +250,17 @@ static int parse_options(int argc, char **argv, options_t *opts)
         } else if (strcmp(arg, "--print") == 0) {
             opts->print = 1;
             continue;
+        } else if (strcmp(arg, "--type") == 0) {
+            fprintf(stderr, "%s: --type was removed: each client now chooses its "
+                    "controller type in HELLO (vc_send --type)\n", argv[0]);
+            return -1;
         }
 
         if (value == NULL) {
             fprintf(stderr, "%s: missing value or unknown option '%s'\n", argv[0], arg);
             return -1;
         }
-        if (strcmp(arg, "--type") == 0) {
-            if (parse_type(value, &opts->type) != 0) {
-                fprintf(stderr, "%s: unknown controller type '%s'\n", argv[0], value);
-                return -1;
-            }
-        } else if (strcmp(arg, "--port") == 0) {
+        if (strcmp(arg, "--port") == 0) {
             if (parse_number(value, 1, 65535, &number) != 0) {
                 fprintf(stderr, "%s: '%s' is not a port number\n", argv[0], value);
                 return -1;
@@ -369,8 +269,9 @@ static int parse_options(int argc, char **argv, options_t *opts)
         } else if (strcmp(arg, "--bind") == 0) {
             opts->bind_address = value;
         } else if (strcmp(arg, "--timeout") == 0) {
-            if (parse_number(value, 1, SLOT_IDLE_MS - 1, &number) != 0) {
-                fprintf(stderr, "%s: timeout must be 1..%d ms\n", argv[0], SLOT_IDLE_MS - 1);
+            if (parse_number(value, 1, VC_SESSION_IDLE_TIMEOUT_MS - 1, &number) != 0) {
+                fprintf(stderr, "%s: timeout must be 1..%d ms\n", argv[0],
+                        VC_SESSION_IDLE_TIMEOUT_MS - 1);
                 return -1;
             }
             opts->timeout_ms = (unsigned)number;
@@ -389,12 +290,11 @@ static int parse_options(int argc, char **argv, options_t *opts)
 
 int main(int argc, char **argv)
 {
-    static app_t    app;   /* static: zero-initialised and off the stack */
-    vc_net_config_t config;
-    vc_net_t       *net = NULL;
-    int             status = EXIT_SUCCESS;
-    int             parsed;
-    int             i;
+    static app_t        app;   /* static: zero-initialised and off the stack */
+    vc_net_config_t     net_cfg;
+    vc_session_config_t session_cfg;
+    int                 status = EXIT_SUCCESS;
+    int                 parsed;
 
     parsed = parse_options(argc, argv, &app.opts);
     if (parsed != 0) {
@@ -413,52 +313,60 @@ int main(int argc, char **argv)
 #endif
     install_signal_handlers();
 
+    memset(&session_cfg, 0, sizeof session_cfg);
+    session_cfg.send = session_send;
+    session_cfg.disconnect = session_disconnect;
+    session_cfg.random32 = random32;
+    session_cfg.log = session_log;
+    session_cfg.on_state = session_state;
+    session_cfg.user = &app;
+    session_cfg.input_timeout_ms = app.opts.timeout_ms;
+    if (vc_sessions_init(&app.sessions, &session_cfg) != 0) {
+        return EXIT_FAILURE;
+    }
+
     if (vc_hid_init() != 0) {
         return EXIT_FAILURE;
     }
 
-    memset(&config, 0, sizeof config);
-    config.bind_address = app.opts.bind_address;
-    config.port = app.opts.port;
-    config.on_input = on_input;
-    config.user = &app;
-    if (vc_net_open(&config, &net) != 0) {
+    memset(&net_cfg, 0, sizeof net_cfg);
+    net_cfg.bind_address = app.opts.bind_address;
+    net_cfg.port = app.opts.port;
+    net_cfg.on_input = on_input;
+    net_cfg.tcp = 1;
+    net_cfg.on_connect = on_connect;
+    net_cfg.on_data = on_data;
+    net_cfg.on_disconnect = on_disconnect;
+    net_cfg.user = &app;
+    if (vc_net_open(&net_cfg, &app.net) != 0) {
         vc_hid_shutdown();
         return EXIT_FAILURE;
     }
 
-    printf("vcd running: %s backend, emulating %s, press Ctrl+C to stop\n",
-           vc_hid_backend_name(),
-           vc_hid_target_for(app.opts.type) == VC_HID_TARGET_X360 ? "an Xbox 360 pad"
-           : vc_hid_target_for(app.opts.type) == VC_HID_TARGET_DS4 ? "a DualShock 4"
-           : "an evdev gamepad");
+    printf("vcd running: %s backend, up to %d controllers on port %u, press Ctrl+C to stop\n",
+           vc_hid_backend_name(), VC_MAX_SLOTS, (unsigned)vc_net_port(app.net));
     if (strcmp(vc_hid_backend_name(), "stub") == 0) {
         printf("note: built with the stub backend, so no gamepad appears in the OS "
                "(see docs/BUILD.md)\n");
     }
 
     while (!g_stop) {
-        if (vc_net_poll(net, POLL_INTERVAL_MS) < 0) {
+        if (vc_net_poll(app.net, POLL_INTERVAL_MS) < 0) {
             fprintf(stderr, "the network listener failed; shutting down\n");
             status = EXIT_FAILURE;
             break;
         }
-        check_timeouts(&app);
+        vc_sessions_tick(&app.sessions, now_ms());
     }
 
-    /* Shutdown order: release and unplug the pads, then the driver, then the
-     * socket. Reached on Ctrl+C and on a listener failure alike. */
+    /* Shutdown order: tell the clients and unplug the pads, then the driver,
+     * then the sockets. Reached on Ctrl+C and on a listener failure alike. */
     if (g_stop) {
         printf("stop requested, shutting down\n");
     }
-    for (i = 0; i < VC_MAX_SLOTS; i++) {
-        if (app.slots[i].in_use) {
-            neutralise(&app.slots[i]);
-            close_slot(&app, &app.slots[i], "shutdown");
-        }
-    }
+    vc_sessions_shutdown(&app.sessions);
     vc_hid_shutdown();
-    vc_net_close(net);
+    vc_net_close(app.net);
     printf("vcd stopped\n");
     return status;
 }
